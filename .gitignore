@@ -1,0 +1,11 @@
+build/
+build-*/
+*.log
+*.o
+*.so
+*.so.*
+*.rpm
+*.deb
+__pycache__/
+.env
+*.token

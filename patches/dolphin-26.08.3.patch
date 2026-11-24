@@ -1,0 +1,131 @@
+diff --git a/src/kitemviews/kitemlistwidget.cpp b/src/kitemviews/kitemlistwidget.cpp
+index e792844..24a5815 100644
+--- a/src/kitemviews/kitemlistwidget.cpp
++++ b/src/kitemviews/kitemlistwidget.cpp
+@@ -16,6 +16,14 @@
+ 
+ #include <QApplication>
+ #include <QPainter>
++#include <algorithm>
++#include <QSettings>
++#include <QDir>
++#include <QElapsedTimer>
++#include <QUrl>
++#include <QColor>
++#include <QStringList>
++#include <KFileMetaData/UserMetaData>
+ #include <QPropertyAnimation>
+ #include <QStyleOption>
+ 
+@@ -87,6 +95,80 @@ void KItemListWidget::setData(const QHash<QByteArray, QVariant> &data, const QSe
+         }
+         dataChanged(m_data, roles);
+     }
++    // Dolphin Color Tags - cached metadata
++    if (roles.isEmpty() || roles.contains("url") || roles.contains("tags")) {
++        QColor color;
++        const QUrl url = m_data.value("url").toUrl();
++
++        if (url.isLocalFile()) {
++            KFileMetaData::UserMetaData metadata(url.toLocalFile());
++            // Color Tags V0.2 registry
++            static QSettings config(
++                QDir::homePath() + QStringLiteral("/.config/dolphin-colortagsrc"),
++                QSettings::IniFormat);
++
++            static QElapsedTimer refreshTimer;
++
++            if (!refreshTimer.isValid() || refreshTimer.elapsed() > 1000) {
++                config.sync();
++                refreshTimer.restart();
++            }
++
++            QStringList tags = metadata.tags();
++
++            // Color Tags V0.3 priority
++            auto priority = [](const QString &tag) {
++                const QString name = tag.toLower();
++
++                if (name.contains(QStringLiteral("remover")))
++                    return 0;
++                if (name.contains(QStringLiteral("modificado")))
++                    return 1;
++                if (name.contains(QStringLiteral("adicionado")))
++                    return 2;
++                if (name.contains(QStringLiteral("personalizado")))
++                    return 3;
++                if (name.contains(QStringLiteral("original")))
++                    return 5;
++
++                return 4;
++            };
++
++            std::stable_sort(tags.begin(), tags.end(),
++                [priority](const QString &a, const QString &b) {
++                    return priority(a) < priority(b);
++                });
++
++            if (config.value(QStringLiteral("Appearance/Enabled"), true).toBool()) {
++                for (const QString &tag : tags) {
++                    color = QColor(config.value(
++                        QStringLiteral("Colors/") + tag).toString());
++
++                    if (color.isValid())
++                        break;
++
++                    const QString name = tag.toLower();
++
++                    if (name.contains(QStringLiteral("original")))
++                        color = QColor("#22c55e");
++                    else if (name.contains(QStringLiteral("adicionado")))
++                        color = QColor("#3b82f6");
++                    else if (name.contains(QStringLiteral("modificado")))
++                        color = QColor("#f59e0b");
++                    else if (name.contains(QStringLiteral("remover")))
++                        color = QColor("#ef4444");
++                    else if (name.contains(QStringLiteral("personalizado")))
++                        color = QColor("#a855f7");
++
++                    if (color.isValid())
++                        break;
++                }
++            }
++        }
++
++        setProperty("colorTagsBackground", color);
++    }
++
+     update();
+ }
+ 
+@@ -121,6 +203,30 @@ void KItemListWidget::paint(QPainter *painter, const QStyleOptionGraphicsItem *o
+         painter->fillRect(backgroundRect, backgroundColor);
+     }
+ 
++    // Dolphin Color Tags - rounded background
++    const QColor tagColor = property("colorTagsBackground").value<QColor>();
++
++    if (tagColor.isValid() && !m_selected) {
++        painter->save();
++        painter->setRenderHint(QPainter::Antialiasing, true);
++
++        QColor fill = tagColor;
++        fill.setAlphaF(0.25 * (1.0 - m_hoverOpacity));
++
++        QColor border = tagColor;
++        border.setAlphaF(0.60 * (1.0 - m_hoverOpacity));
++
++        painter->setBrush(fill);
++        painter->setPen(QPen(border, 1.0));
++
++        const QRectF area =
++            QRectF(0, 0, size().width(), size().height())
++                .adjusted(2, 2, -2, -2);
++
++        painter->drawRoundedRect(area, 8.0, 8.0);
++        painter->restore();
++    }
++
+     const QStyle::State selectedState(m_selected ? QStyle::State_Selected : QStyle::State(0));
+     if ((m_selected || m_current) && m_editedRole.isEmpty()) {
+         const QStyle::State activeState(isActiveWindow() && widget->hasFocus() ? QStyle::State_Active : 0);

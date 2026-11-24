@@ -1,0 +1,435 @@
+diff --git a/src/kedittagsdialog.cpp b/src/kedittagsdialog.cpp
+index 9042151..0fcfad9 100644
+--- a/src/kedittagsdialog.cpp
++++ b/src/kedittagsdialog.cpp
+@@ -11,6 +11,12 @@
+ #include <KLocalizedString>
+ 
+ #include <QDialogButtonBox>
++#include <QColorDialog>
++#include <QSettings>
++#include <QDir>
++#include <QPixmap>
++#include <QIcon>
++#include <QVariantMap>
+ #include <QHBoxLayout>
+ #include <QLabel>
+ #include <QLineEdit>
+@@ -71,6 +77,52 @@ KEditTagsDialog::KEditTagsDialog(const QStringList &tags, QWidget *parent)
+     newTagLayout->addWidget(newTagLabel);
+     newTagLayout->addWidget(m_newTagEdit, 1);
+ 
++    // Color Tags V0.2
++    auto colorButton = new QPushButton(QStringLiteral("Escolher cor"), this);
++
++    connect(colorButton, &QPushButton::clicked, this, [this, colorButton]() {
++        QString tag = m_newTagEdit->text().simplified();
++        tag = tag.split(QLatin1Char('/'), Qt::SkipEmptyParts)
++                 .join(QLatin1Char('/'));
++
++        if (tag.isEmpty())
++            return;
++
++        QSettings config(
++            QDir::homePath() + QStringLiteral("/.config/dolphin-colortagsrc"),
++            QSettings::IniFormat);
++
++        QVariantMap pending = property("pendingTagColors").toMap();
++
++        QColor initial(pending.value(tag,
++            config.value(QStringLiteral("Colors/") + tag,
++            QStringLiteral("#22C55E"))).toString());
++
++        if (!initial.isValid())
++            initial = QColor(QStringLiteral("#22C55E"));
++
++        const QColor color = QColorDialog::getColor(
++            initial, this,
++            QStringLiteral("Cor da etiqueta"),
++            QColorDialog::DontUseNativeDialog);
++
++        if (!color.isValid())
++            return;
++
++        pending.insert(tag, color.name());
++        setProperty("pendingTagColors", pending);
++
++        QPixmap preview(20, 20);
++        preview.fill(color);
++        colorButton->setIcon(QIcon(preview));
++        colorButton->setText(color.name().toUpper());
++
++        if (auto item = findTag(tag))
++            item->setIcon(QIcon(preview));
++    });
++
++    newTagLayout->addWidget(colorButton);
++
+     topLayout->addWidget(label);
+     topLayout->addWidget(m_treeView);
+     topLayout->addLayout(newTagLayout);
+@@ -78,11 +130,25 @@ KEditTagsDialog::KEditTagsDialog(const QStringList &tags, QWidget *parent)
+ 
+     resize(sizeHint());
+ 
++    QSettings registry(
++        QDir::homePath() + QStringLiteral("/.config/dolphin-colortagsrc"),
++        QSettings::IniFormat);
++
++    registry.beginGroup(QStringLiteral("Colors"));
++    m_allTags = registry.allKeys();
++    registry.endGroup();
++
++    setupModel(m_allTags, m_tags);
++
+     auto job = new Baloo::TagListJob();
+     connect(job, &Baloo::TagListJob::finished, this, [this](KJob *job) {
+         auto tjob = static_cast<Baloo::TagListJob *>(job);
+-        m_allTags = tjob->tags();
+-        setupModel(m_allTags, m_tags);
++        m_allTags.append(tjob->tags());
++        m_allTags.removeDuplicates();
++        setupModel(m_allTags, {});
++        if (m_newItem &&
++            m_allTags.contains(m_newItem->data(canonicalTagPathRole).toString()))
++            m_newItem = nullptr;
+     });
+ 
+     job->start();
+@@ -181,6 +247,25 @@ void KEditTagsDialog::slotAcceptedButtonClicked()
+     };
+     recurseInTree(m_model->invisibleRootItem());
+ 
++    QSettings config(
++        QDir::homePath() + QStringLiteral("/.config/dolphin-colortagsrc"),
++        QSettings::IniFormat);
++
++    config.beginGroup(QStringLiteral("Colors"));
++
++    for (const QString &tag : std::as_const(m_tags)) {
++        if (!tag.isEmpty() && !config.contains(tag))
++            config.setValue(tag, QString());
++    }
++
++    const QVariantMap pending = property("pendingTagColors").toMap();
++
++    for (auto it = pending.cbegin(); it != pending.cend(); ++it)
++        config.setValue(it.key(), it.value());
++
++    config.endGroup();
++    config.sync();
++
+     accept();
+ }
+ 
+@@ -221,8 +306,10 @@ void KEditTagsDialog::slotTextEdited(const QString &text)
+         return;
+     }
+ 
+-    if (!findTag(text)) {
+-        m_newItem = ensureItemForTagExists(text);
++    if (!findTag(tagText)) {
++        m_newItem = ensureItemForTagExists(tagText);
++        if (!m_newItem)
++            return;
+         m_newItem->setIcon(QIcon::fromTheme(QStringLiteral("tag-new")));
+         m_newItem->setCheckState(Qt::Checked);
+     }
+diff --git a/src/tagsfileitemactionplugin/tagsfileitemaction.cpp b/src/tagsfileitemactionplugin/tagsfileitemaction.cpp
+index eef9ca1..07bc9b5 100644
+--- a/src/tagsfileitemactionplugin/tagsfileitemaction.cpp
++++ b/src/tagsfileitemactionplugin/tagsfileitemaction.cpp
+@@ -7,6 +7,16 @@
+ #include "tagsfileitemaction.h"
+ 
+ #include <QAction>
++#include <QDialog>
++#include <QDialogButtonBox>
++#include <QVBoxLayout>
++#include <QRadioButton>
++#include <QComboBox>
++#include <QButtonGroup>
++#include <QLabel>
++#include <QSettings>
++#include <QDir>
++#include <QMessageBox>
+ #include <QFileInfo>
+ #include <QIcon>
+ #include <QInputDialog>
+@@ -34,84 +44,217 @@ TagsFileItemAction::~TagsFileItemAction()
+     delete m_metaData;
+ }
+ 
+-QList<QAction *> TagsFileItemAction::actions(const KFileItemListProperties &fileItemInfos, QWidget *parentWidget)
++
++// Color Tags V0.3
++QList<QAction *> TagsFileItemAction::actions(
++    const KFileItemListProperties &fileItemInfos,
++    QWidget *parentWidget)
+ {
+-    // This action only applies to a single file. Bail out for multiple
+-    // selection or empty list.
+-    if (fileItemInfos.urlList().size() != 1) {
+-        return {};
+-    }
++    QStringList paths;
++    QStringList availableTags;
+ 
+-    const QString filePath = fileItemInfos.urlList().constFirst().toLocalFile();
+-    if (!QFileInfo(filePath).isWritable()) {
+-        return {};
++    for (const QUrl &url : fileItemInfos.urlList()) {
++        if (!url.isLocalFile())
++            continue;
++
++        const QString path = url.toLocalFile();
++
++        if (!QFileInfo(path).isWritable())
++            continue;
++
++        KFileMetaData::UserMetaData metadata(path);
++
++        if (!metadata.isSupported())
++            continue;
++
++        paths.append(path);
++        availableTags.append(metadata.tags());
+     }
+ 
+-    m_metaData = new KFileMetaData::UserMetaData(filePath);
+-    if (!m_metaData->isSupported()) {
++    paths.removeDuplicates();
++
++    if (paths.isEmpty())
+         return {};
+-    }
+ 
+-    QMenu *menu = new QMenu(i18n("Assign Tags"), parentWidget);
++    QSettings registry(
++        QDir::homePath() +
++        QStringLiteral("/.config/dolphin-colortagsrc"),
++        QSettings::IniFormat);
++
++    registry.beginGroup(QStringLiteral("Colors"));
++    availableTags.append(registry.allKeys());
++    registry.endGroup();
++
++    availableTags.removeDuplicates();
++    availableTags.sort(Qt::CaseInsensitive);
++
++    auto menu = new QMenu(
++        QStringLiteral("Gerenciar etiquetas"), parentWidget);
++
+     menu->setIcon(QIcon::fromTheme(QStringLiteral("tag")));
+ 
+-    connect(&m_tagsLister, &KCoreDirLister::itemsAdded, this, [this, menu](const QUrl &, const KFileItemList &items) {
+-        const QStringList fileTags = m_metaData->tags();
++    auto manageAction = menu->addAction(
++        QIcon::fromTheme(QStringLiteral("document-edit")),
++        QStringLiteral("Editar etiquetas em massa..."));
+ 
+-        // The file may be located outside an indexed path, or is not indexed yet
+-        // Show the complete tag list, i.e. the union of file and index DB tags
+-        QStringList allTags;
+-        allTags.reserve(fileTags.size() + items.size());
+-        allTags.append(fileTags);
+-        for (const KFileItem &item : items) {
+-            allTags.append(item.name());
++    connect(manageAction, &QAction::triggered, menu,
++        [paths, availableTags, parentWidget]() {
++
++        QDialog dialog(parentWidget);
++
++        dialog.setWindowTitle(
++            QStringLiteral("Gerenciar etiquetas"));
++
++        auto layout = new QVBoxLayout(&dialog);
++
++        layout->addWidget(new QLabel(
++            QStringLiteral("%1 arquivo(s) selecionado(s)")
++                .arg(paths.size()), &dialog));
++
++        auto group = new QButtonGroup(&dialog);
++
++        const QStringList modes = {
++            QStringLiteral("Adicionar etiqueta"),
++            QStringLiteral("Substituir etiquetas existentes"),
++            QStringLiteral("Remover etiqueta especifica"),
++            QStringLiteral("Remover todas as etiquetas")
++        };
++
++        for (int i = 0; i < modes.size(); ++i) {
++            auto radio = new QRadioButton(modes.at(i), &dialog);
++            group->addButton(radio, i);
++            layout->addWidget(radio);
++
++            if (i == 0)
++                radio->setChecked(true);
+         }
+-        allTags.sort(Qt::CaseInsensitive);
+-        allTags.removeDuplicates();
+-
+-        for (const QString &name : std::as_const(allTags)) {
+-            QAction *action = menu->addAction(QIcon::fromTheme(QStringLiteral("tag")), name);
+-            action->setCheckable(true);
+-            action->setChecked(fileTags.contains(name));
+-
+-            connect(action, &QAction::triggered, this, [this, name](bool isChecked) {
+-                QStringList newTags = m_metaData->tags();
+-                if (isChecked) {
+-                    newTags.append(name);
+-                } else {
+-                    newTags.removeAll(name);
++
++        auto tags = new QComboBox(&dialog);
++        tags->setEditable(true);
++        tags->addItems(availableTags);
++        tags->setCurrentIndex(-1);
++        layout->addWidget(tags);
++
++        QObject::connect(
++            group, &QButtonGroup::idClicked,
++            tags, [tags](int id) {
++                tags->setEnabled(id != 3);
++            });
++
++        auto buttons = new QDialogButtonBox(
++            QDialogButtonBox::Save |
++            QDialogButtonBox::Cancel, &dialog);
++
++        layout->addWidget(buttons);
++
++        QObject::connect(
++            buttons, &QDialogButtonBox::rejected,
++            &dialog, &QDialog::reject);
++
++        QObject::connect(
++            buttons, &QDialogButtonBox::accepted,
++            &dialog, [&]() {
++
++                if (group->checkedId() != 3 &&
++                    tags->currentText().trimmed().isEmpty()) {
++
++                    QMessageBox::warning(
++                        &dialog,
++                        QStringLiteral("Etiquetas"),
++                        QStringLiteral("Escolha uma etiqueta."));
++                    return;
++                }
++
++                if (group->checkedId() == 1 ||
++                    group->checkedId() == 3) {
++
++                    if (QMessageBox::question(
++                        &dialog,
++                        QStringLiteral("Confirmar"),
++                        QStringLiteral(
++                            "Alterar as etiquetas existentes "
++                            "dos arquivos selecionados?"))
++                        != QMessageBox::Yes)
++                        return;
+                 }
+-                m_metaData->setTags(newTags);
++
++                dialog.accept();
+             });
+-        }
+-    });
+ 
+-    QAction *newAction = new QAction(i18n("Edit tags..."), menu);
+-    newAction->setIcon(QIcon::fromTheme(QStringLiteral("tag-new")));
++        dialog.resize(460, 270);
++
++        if (dialog.exec() != QDialog::Accepted)
++            return;
++
++        const int mode = group->checkedId();
++        const QString tag = tags->currentText().trimmed();
++
++        int failures = 0;
++
++        for (const QString &path : paths) {
++            KFileMetaData::UserMetaData metadata(path);
++
++            QStringList current = metadata.tags();
++
++            switch (mode) {
++                case 0:
++                    if (!current.contains(tag))
++                        current.append(tag);
++                    break;
++
++                case 1:
++                    current = QStringList{tag};
++                    break;
+ 
+-    connect(newAction, &QAction::triggered, this, [this, parentWidget] {
+-        // Use KEditTagsDialog so the user can create and select hierarchical tags
+-        KEditTagsDialog *editDialog = new KEditTagsDialog(m_metaData->tags(), parentWidget);
+-        editDialog->setWindowModality(Qt::WindowModal);
+-        connect(editDialog, &QDialog::finished, this, [this, editDialog](int result) {
+-            if (result == QDialog::Accepted) {
+-                m_metaData->setTags(editDialog->tags());
++                case 2:
++                    current.removeAll(tag);
++                    break;
++
++                case 3:
++                    current.clear();
++                    break;
+             }
+-            editDialog->deleteLater();
+-        });
+-        editDialog->open();
+-    });
+ 
+-    m_tagsLister.openUrl(QUrl(QStringLiteral("tags:/")), KCoreDirLister::OpenUrlFlag::Reload);
+-    menu->addAction(newAction);
+-    menu->addSeparator();
+-    menu->setParent(parentWidget, Qt::Popup);
++            current.removeDuplicates();
++            metadata.setTags(current);
++
++            KFileMetaData::UserMetaData check(path);
++            auto saved = check.tags();
+ 
+-    connect(menu, &QObject::destroyed, this, [this]() {
+-        disconnect(&m_tagsLister, &KCoreDirLister::itemsAdded, this, nullptr);
+-        m_tagsLister.stop();
++            current.sort();
++            saved.sort();
++
++            if (current != saved)
++                ++failures;
++        }
++
++        if (failures > 0) {
++            QMessageBox::warning(
++                parentWidget,
++                QStringLiteral("Etiquetas"),
++                QStringLiteral(
++                    "%1 arquivo(s) nao foram atualizados.")
++                    .arg(failures));
++        }
+     });
+ 
++    if (paths.size() == 1) {
++        auto editAction = menu->addAction(
++            QIcon::fromTheme(QStringLiteral("tag-new")),
++            QStringLiteral("Editar etiquetas e cores..."));
++
++        connect(editAction, &QAction::triggered, menu,
++            [paths, parentWidget]() {
++
++            KFileMetaData::UserMetaData metadata(paths.first());
++
++            KEditTagsDialog dialog(metadata.tags(), parentWidget);
++
++            if (dialog.exec() == QDialog::Accepted)
++                metadata.setTags(dialog.tags());
++        });
++    }
++
+     return {menu->menuAction()};
+ }
+ 
